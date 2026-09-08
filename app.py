@@ -2,6 +2,7 @@ import io
 import json
 import os
 import re
+import time
 from typing import Any, Dict, List
 
 import streamlit as st
@@ -22,7 +23,13 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-MODEL_NAME = "gemini-3.6-flash"
+MODEL_CANDIDATES = [
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+]
+MAX_RETRIES_PER_MODEL = 3
+RETRY_DELAYS_SECONDS = [2, 4, 8]
 
 
 # ============================================================
@@ -342,11 +349,32 @@ Return ONLY valid JSON with this exact structure:
 """
 
 
+def is_retryable_error(exc: Exception) -> bool:
+    """Return True for temporary Gemini capacity/rate-limit errors."""
+    message = str(exc).upper()
+    retryable_markers = [
+        "503",
+        "UNAVAILABLE",
+        "429",
+        "RESOURCE_EXHAUSTED",
+        "TOO MANY REQUESTS",
+        "DEADLINE EXCEEDED",
+        "504",
+        "TIMEOUT",
+    ]
+    return any(marker in message for marker in retryable_markers)
+
+
 def analyze_resume(
     resume_text: str,
     job_description: str,
-) -> Dict[str, Any]:
-    """Send resume and optional JD to Gemini and return structured analysis."""
+) -> tuple[Dict[str, Any], str]:
+    """
+    Analyze the resume with Gemini using retries and automatic model fallback.
+
+    Temporary 503/429/time-out errors are retried with exponential backoff.
+    If a model remains unavailable, the next Flash model is tried.
+    """
     api_key = get_gemini_api_key()
 
     if not api_key:
@@ -356,25 +384,47 @@ def analyze_resume(
         )
 
     client = genai.Client(api_key=api_key)
-
     prompt = build_analysis_prompt(
         resume_text=resume_text,
         job_description=job_description,
     )
 
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            temperature=0.2,
-            response_mime_type="application/json",
-        ),
-    )
+    last_error = None
 
-    if not response.text:
-        raise RuntimeError("Gemini returned an empty response.")
+    for model_name in MODEL_CANDIDATES:
+        for attempt in range(MAX_RETRIES_PER_MODEL):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                    ),
+                )
 
-    return parse_json_response(response.text)
+                if not response.text:
+                    raise RuntimeError(
+                        f"{model_name} returned an empty response."
+                    )
+
+                return parse_json_response(response.text), model_name
+
+            except Exception as exc:
+                last_error = exc
+
+                if not is_retryable_error(exc):
+                    raise RuntimeError(
+                        f"Gemini request failed with {model_name}: {exc}"
+                    ) from exc
+
+                if attempt < MAX_RETRIES_PER_MODEL - 1:
+                    time.sleep(RETRY_DELAYS_SECONDS[attempt])
+
+    raise RuntimeError(
+        "Gemini is temporarily busy or unavailable. The app tried "
+        "multiple Gemini Flash models and automatic retries. Please wait "
+        "a few minutes and try again."
+    ) from last_error
 
 
 # ============================================================
@@ -605,12 +655,13 @@ if uploaded_file is not None:
                         "analysis input was limited to 60,000 characters."
                     )
 
-                analysis = analyze_resume(
+                analysis, model_used = analyze_resume(
                     resume_text=resume_text,
                     job_description=job_description,
                 )
 
                 st.session_state["analysis"] = normalize_analysis(analysis)
+                st.session_state["model_used"] = model_used
                 st.session_state["resume_name"] = uploaded_file.name
 
         except Exception as exc:
@@ -635,6 +686,7 @@ if "analysis" in st.session_state:
     # --------------------------------------------------------
 
     st.subheader("🎯 ATS Readiness Score")
+    st.caption(f"Gemini model used: `{st.session_state.get('model_used', MODEL_CANDIDATES[0])}`")
 
     score = result["ats_score"]
 
